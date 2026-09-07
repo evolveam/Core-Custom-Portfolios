@@ -71,6 +71,60 @@ function indexed6040(dates, prices, startDate){
   return dates.slice(startIdx).map(d => ({d, v: Math.round((0.6*(prices.SPY[d]/baseSpy) + 0.4*(prices.AGG[d]/baseAgg))*1e6)/1e6}));
 }
 
+const RISK_TICKERS_ORDER = ["SPY","VGT","XLV","EWJ","ACWI","CNYA","INFR","CAPVX","FJP","GRID","FTXL","CIBR","MRVL","CLS","AGG"];
+
+function dailyReturns(v){ const out=[]; for(let i=1;i<v.length;i++) out.push(v[i]/v[i-1]-1); return out; }
+function annualizedVol(v){
+  const r = dailyReturns(v); const n = r.length;
+  const mean = r.reduce((a,b)=>a+b,0)/n;
+  const variance = r.reduce((a,b)=>a+(b-mean)*(b-mean),0)/(n-1);
+  return Math.sqrt(variance) * Math.sqrt(252);
+}
+function maxDrawdown(v){
+  let peak = v[0], worst = 0;
+  for (const x of v){ if (x > peak) peak = x; const dd = x/peak - 1; if (dd < worst) worst = dd; }
+  return worst;
+}
+function pearson(a, b){
+  const n = a.length;
+  const ma = a.reduce((x,y)=>x+y,0)/n, mb = b.reduce((x,y)=>x+y,0)/n;
+  let cov=0, va=0, vb=0;
+  for (let i=0;i<n;i++){ cov += (a[i]-ma)*(b[i]-mb); va += (a[i]-ma)**2; vb += (b[i]-mb)**2; }
+  const denom = Math.sqrt(va*vb);
+  return denom === 0 ? null : cov/denom;
+}
+function computeRisk(dates, prices){
+  const startIdx = dates.indexOf(LONG_START);
+  const windowDates = dates.slice(startIdx);
+
+  function idxPortfolio(weights){
+    const base = {}; for (const tk in weights) base[tk] = prices[tk][windowDates[0]];
+    return windowDates.map(d => { let v=0; for (const tk in weights) v += (weights[tk]/100)*(prices[tk][d]/base[tk]); return v; });
+  }
+  function idxSingle(tk){ const base = prices[tk][windowDates[0]]; return windowDates.map(d => prices[tk][d]/base); }
+  function idx6040(){
+    const baseSpy = prices.SPY[windowDates[0]], baseAgg = prices.AGG[windowDates[0]];
+    return windowDates.map(d => 0.6*(prices.SPY[d]/baseSpy) + 0.4*(prices.AGG[d]/baseAgg));
+  }
+
+  const series = { core: idxPortfolio(CORE), custom: idxPortfolio(CUSTOM), spx: idxSingle("SPY"), sixtyforty: idx6040() };
+  const volatility = {}, maxDD = {};
+  for (const k in series){ volatility[k] = Math.round(annualizedVol(series[k])*1e4)/1e4; maxDD[k] = Math.round(maxDrawdown(series[k])*1e4)/1e4; }
+
+  const returns = {};
+  for (const tk of RISK_TICKERS_ORDER) returns[tk] = dailyReturns(windowDates.map(d => prices[tk][d]));
+  const matrix = RISK_TICKERS_ORDER.map(t1 => RISK_TICKERS_ORDER.map(t2 => {
+    const c = pearson(returns[t1], returns[t2]);
+    return c === null ? null : Math.round(c*1000)/1000;
+  }));
+
+  return {
+    period: { start: LONG_START, end: windowDates[windowDates.length-1] },
+    volatility, maxDrawdown: maxDD,
+    correlation: { tickers: RISK_TICKERS_ORDER, matrix }
+  };
+}
+
 async function main(){
   const seed = JSON.parse(fs.readFileSync(PRICES_PATH, "utf8"));
   let dates = seed.dates.slice();
@@ -161,12 +215,17 @@ async function main(){
     }
   };
 
+  const risk = computeRisk(dates, prices);
+
   fs.writeFileSync(PRICES_PATH, JSON.stringify({dates, prices, capvxAnchors: seed.capvxAnchors}));
 
   let html = fs.readFileSync(INDEX_PATH, "utf8");
-  const re = /(<script id="portfolio-data" type="application\/json">)([\s\S]*?)(<\/script>)/;
-  if (!re.test(html)) throw new Error("portfolio-data script tag not found in index.html");
-  html = html.replace(re, (m, a, b, c) => a + JSON.stringify(out) + c);
+  const reData = /(<script id="portfolio-data" type="application\/json">)([\s\S]*?)(<\/script>)/;
+  const reRisk = /(<script id="risk-data" type="application\/json">)([\s\S]*?)(<\/script>)/;
+  if (!reData.test(html)) throw new Error("portfolio-data script tag not found in index.html");
+  if (!reRisk.test(html)) throw new Error("risk-data script tag not found in index.html");
+  html = html.replace(reData, (m, a, b, c) => a + JSON.stringify(out) + c);
+  html = html.replace(reRisk, (m, a, b, c) => a + JSON.stringify(risk) + c);
   fs.writeFileSync(INDEX_PATH, html);
 
   console.log("Agregado hasta: " + dates[dates.length-1] + (capvxNav ? ` (CAPVX NAV ${capvxNav.date} @ ${capvxNav.nav})` : " (CAPVX: sin lectura nueva, interpolado)"));
