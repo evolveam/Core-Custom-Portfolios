@@ -14,42 +14,81 @@ const SHORT_START = "2026-07-17";
 const PRICES_PATH = "data/prices.json";
 const INDEX_PATH = "index.html";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
+// Yahoo ya no publica precios de INFR (la serie quedaba plana): se usa IGF (iShares Global Infrastructure)
+// como proxy de precios. La posición sigue llamándose INFR en los portafolios.
+const PRICE_PROXY = {INFR: "IGF"};
+// Cambiar este número fuerza una regeneración completa de la página aunque no haya sesión nueva.
+const DATA_VERSION = 2;
+const HISTORY_START = "2021-08-30";
+// CAPVX: el sitio oficial no admite descargas automatizadas. NAV diario real hasta CAPVX_CUT; después,
+// rendimientos mensuales oficiales del factsheet (data/capvx_monthly_official.json) y NAV diarios capturados
+// a mano (data/capvx_nav_manual.json), con interpolación geométrica entre anclas.
+const CAPVX_CUT = "2025-12-31";
+const CAPVX_MONTHLY_PATH = "data/capvx_monthly_official.json";
+const CAPVX_MANUAL_PATH = "data/capvx_nav_manual.json";
 
 function isoFromUnix(t){ return new Date(t*1000).toISOString().slice(0,10); }
 
+// Descarga SIEMPRE la historia completa: Yahoo reescala todo el adjclose en cada ex-dividend o split, así que
+// mezclar historia vieja con días nuevos borraría los dividendos del rendimiento total.
 async function fetchYahoo(ticker){
   const now = Math.floor(Date.now()/1000);
-  const period1 = now - 30*86400; // 30-day lookback window for overlap/safety
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?period1=${period1}&period2=${now}&interval=1d`;
+  const period1 = Math.floor(Date.parse(HISTORY_START + "T00:00:00Z")/1000);
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?period1=${period1}&period2=${now}&interval=1d&events=div%2Csplit`;
   const res = await fetch(url, { headers: { "User-Agent": UA } });
   if (!res.ok) throw new Error(`${ticker}: HTTP ${res.status}`);
   const json = await res.json();
   const r = json.chart.result[0];
   const ts = r.timestamp || [];
-  const closeArr = r.indicators.quote[0].close;
+  const quote = r.indicators.quote[0] || {};
+  if (!ts.length || !quote.close) throw new Error(`${ticker}: sin precios`);
+  const closeArr = quote.close;
   const adjArr = r.indicators.adjclose ? r.indicators.adjclose[0].adjclose : null;
+  // Barra de hoy con la sesión abierta = precio en vivo, no cierre: se descarta.
+  const reg = (r.meta && r.meta.currentTradingPeriod && r.meta.currentTradingPeriod.regular) || {};
+  const openBar = (reg.end && now < reg.end + 15*60) ? isoFromUnix(reg.start) : null;
   const out = {};
   for (let i=0;i<ts.length;i++){
     const c = (adjArr && adjArr[i]!=null) ? adjArr[i] : closeArr[i];
-    if (c==null) continue;
-    out[isoFromUnix(ts[i])] = Math.round(c*10000)/10000;
+    const d = isoFromUnix(ts[i]);
+    if (c==null || d === openBar) continue;
+    out[d] = Math.round(c*10000)/10000;
   }
   return out;
 }
 
-async function fetchCapvxNav(){
-  const url = "https://www.acprivatemarkets.com/funds/capvx/";
-  const res = await fetch(url, { headers: { "User-Agent": UA } });
-  if (!res.ok) throw new Error(`CAPVX page: HTTP ${res.status}`);
-  const html = await res.text();
-  const m = html.match(/<li class="fund-stats__item[^"]*">\s*<div class="fund-stats__item-header[^"]*">\$([\d.]+)<\/div>\s*<div class="fund-stats__item-body">\s*<div class="fund-stats__item-info[^"]*">[\s\S]*?NAV[\s\S]*?<\/div>\s*<div class="fund-stats__item-date">\s*As of (\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
-  if (!m) throw new Error("CAPVX: NAV pattern not found on official fund page");
-  const nav = parseFloat(m[1]);
-  let year = parseInt(m[4],10); if (year < 100) year += 2000;
-  const month = String(m[2]).padStart(2,'0');
-  const day = String(m[3]).padStart(2,'0');
-  const date = `${year}-${month}-${day}`;
-  return { date, nav };
+// Serie diaria de CAPVX sobre el calendario `dates`.
+function buildCapvx(oldCapvx, dates){
+  const s = {};
+  for (const d of Object.keys(oldCapvx)) if (d <= CAPVX_CUT) s[d] = oldCapvx[d];
+  const baseD = Object.keys(s).sort().pop();
+  let level = s[baseD];
+  const monthlyRaw = fs.existsSync(CAPVX_MONTHLY_PATH) ? JSON.parse(fs.readFileSync(CAPVX_MONTHLY_PATH, "utf8")) : {};
+  const months = Object.keys(monthlyRaw).filter(k => !k.startsWith("_")).sort();
+  let expect = baseD.slice(0,7);
+  for (const ym of months){ // meses consecutivos: un mes faltante se perdería en silencio
+    let [y,m] = expect.split("-").map(Number); m += 1; if (m === 13){ m = 1; y += 1; }
+    expect = `${y}-${String(m).padStart(2,"0")}`;
+    if (ym !== expect) throw new Error(`capvx_monthly_official.json: falta ${expect} (siguiente: ${ym})`);
+  }
+  const manual = fs.existsSync(CAPVX_MANUAL_PATH) ? JSON.parse(fs.readFileSync(CAPVX_MANUAL_PATH, "utf8")) : {};
+  const anchors = [[baseD, level]];
+  for (const ym of months){
+    const md = dates.filter(d => d.slice(0,7) === ym);
+    if (!md.length) continue;
+    level *= 1 + monthlyRaw[ym]/100;
+    anchors.push([md[md.length-1], level]);
+  }
+  const lastOfficial = anchors[anchors.length-1][0];
+  for (const d of Object.keys(manual).sort()) if (d > lastOfficial) anchors.push([d, +manual[d]]);
+  for (let a=1;a<anchors.length;a++){
+    const [d0,v0] = anchors[a-1], [d1,v1] = anchors[a];
+    const seg = dates.filter(d => d > d0 && d <= d1);
+    seg.forEach((d,k) => { s[d] = Math.round(v0*Math.pow(v1/v0,(k+1)/seg.length)*10000)/10000; });
+  }
+  let last = null; const out = {};
+  for (const d of dates){ if (s[d] != null) last = s[d]; if (last != null) out[d] = last; }
+  return out;
 }
 
 function indexedPortfolio(weights, wd, prices){
@@ -363,18 +402,20 @@ async function main(){
   const prices = seed.prices;
   const dateSet = new Set(dates);
 
-  let newDatesFound = false;
+  // Un cambio de DATA_VERSION (corrección de datos o metodología) obliga a regenerar la página.
+  let newDatesFound = seed.dataVersion !== DATA_VERSION;
 
-  // 1. Standard Yahoo tickers: pull recent window, merge new dates, using SPY's calendar as master
-  const fetched = {};
+  // 1. Standard Yahoo tickers: full history (see fetchYahoo), SPY's calendar as master
+  const fetched = {}, failed = [];
   for (const tk of YAHOO_TICKERS){
     try {
-      fetched[tk] = await fetchYahoo(tk);
+      fetched[tk] = await fetchYahoo(PRICE_PROXY[tk] || tk);
     } catch (e) {
       console.error(`WARN: could not fetch ${tk}: ${e.message}`);
-      fetched[tk] = {};
+      fetched[tk] = {}; failed.push(tk);
     }
   }
+  if (failed.includes("SPY") || failed.length > 3) throw new Error(`Fallaron demasiados tickers: ${failed.join(", ")}`);
 
   const newSpyDates = Object.keys(fetched.SPY || {}).filter(d => !dateSet.has(d)).sort();
   if (newSpyDates.length){
@@ -389,41 +430,15 @@ async function main(){
     for (const d of dates){
       if (fetched[tk] && fetched[tk][d] != null) prices[tk][d] = fetched[tk][d];
       if (prices[tk][d] != null) last = prices[tk][d];
-      else if (last != null) prices[tk][d] = last; // forward-fill (illiquid names like INFR)
+      else if (last != null) prices[tk][d] = last; // forward-fill (feriados / huecos)
     }
   }
 
-  // 3. CAPVX: real NAV from the official fund page + linear interpolation for any gap
-  //    since the last known real/interpolated point.
-  let capvxNav = null;
-  try { capvxNav = await fetchCapvxNav(); }
-  catch (e) { console.error(`WARN: could not fetch CAPVX NAV: ${e.message}`); }
-
-  if (!prices.CAPVX) prices.CAPVX = {};
-  const knownCapvxDates = Object.keys(prices.CAPVX).sort();
-  const lastKnownDate = knownCapvxDates[knownCapvxDates.length-1];
-  const lastKnownPrice = prices.CAPVX[lastKnownDate];
-
-  if (capvxNav){
-    if (!dates.includes(capvxNav.date)) { dates.push(capvxNav.date); dates.sort(); newDatesFound = true; }
-    // interpolate any dates between lastKnownDate and capvxNav.date that don't have a CAPVX price yet
-    const gapDates = dates.filter(d => d > lastKnownDate && d <= capvxNav.date && prices.CAPVX[d] == null);
-    const d0 = new Date(lastKnownDate), d1 = new Date(capvxNav.date);
-    const totalDays = (d1-d0) / 86400000;
-    for (const d of gapDates){
-      if (d === capvxNav.date){ prices.CAPVX[d] = capvxNav.nav; continue; }
-      const frac = totalDays > 0 ? (new Date(d)-d0)/86400000/totalDays : 1;
-      prices.CAPVX[d] = Math.round((lastKnownPrice + (capvxNav.nav-lastKnownPrice)*frac)*10000)/10000;
-    }
-  }
-  // forward-fill CAPVX for any remaining dates (e.g. new SPY dates before/without a fresh CAPVX read)
-  {
-    let last = null;
-    for (const d of dates){
-      if (prices.CAPVX[d] != null) last = prices.CAPVX[d];
-      else if (last != null) prices.CAPVX[d] = last;
-    }
-  }
+  // 3. CAPVX: NAV real hasta CAPVX_CUT + rendimientos mensuales oficiales + NAV manuales (ver buildCapvx).
+  //    Si cambian los archivos de CAPVX también se regenera la página.
+  const newCapvx = buildCapvx(prices.CAPVX || {}, dates);
+  if (JSON.stringify(newCapvx) !== JSON.stringify(prices.CAPVX)) newDatesFound = true;
+  prices.CAPVX = newCapvx;
 
   if (!newDatesFound){
     console.log("Sin cambios: no hay sesion nueva disponible.");
@@ -467,7 +482,7 @@ async function main(){
   }
   const riskEq = computeEquitiesRisk(dates, prices, eqViewStarts);
 
-  fs.writeFileSync(PRICES_PATH, JSON.stringify({dates, prices, capvxAnchors: seed.capvxAnchors}));
+  fs.writeFileSync(PRICES_PATH, JSON.stringify({dates, prices, capvxAnchors: seed.capvxAnchors, dataVersion: DATA_VERSION}));
 
   let html = fs.readFileSync(INDEX_PATH, "utf8");
   const reData = /(<script id="portfolio-data" type="application\/json">)([\s\S]*?)(<\/script>)/;
@@ -484,7 +499,7 @@ async function main(){
   html = html.replace(reRiskEq, (m, a, b, c) => a + JSON.stringify(riskEq) + c);
   fs.writeFileSync(INDEX_PATH, html);
 
-  console.log("Agregado hasta: " + dates[dates.length-1] + (capvxNav ? ` (CAPVX NAV ${capvxNav.date} @ ${capvxNav.nav})` : " (CAPVX: sin lectura nueva, interpolado)"));
+  console.log("Agregado hasta: " + dates[dates.length-1] + ` (CAPVX al ${dates[dates.length-1]}: ${prices.CAPVX[dates[dates.length-1]]})` + (failed.length ? ` · sin datos nuevos: ${failed.join(", ")}` : ""));
 }
 
 main().catch(err => { console.error(err); process.exit(1); });
